@@ -28,14 +28,9 @@ target_link_libraries(rs-colorize ${OpenCV_LIBS})
 # for windows, default RealSense SDK install folder is set
 # please chenge this location if it is installed in other folder.
 if (WIN32)
-
-include_directories( include C:/Github/forked/librealsense/include/ )
-target_include_directories( rs-colorize PRIVATE C:/Github/forked/librealsense/include/librealsense2 )
-target_link_libraries( rs-colorize C:/Github/forked/librealsense/build/Release/realsense2.lib )
-
-# include_directories( include C:/Program\ Files\ \(x86\)/Intel\ RealSense\ SDK\ 2.0/include )
-# target_include_directories( rs-colorize PRIVATE C:/Program\ Files\ \(x86\)/Intel\ RealSense\ SDK\ 2.0/include )
-# target_link_libraries( rs-colorize C:/Program\ Files\ \(x86\)/Intel\ RealSense\ SDK\ 2.0/lib/x64/realsense2.lib )
+include_directories( include C:/Program\ Files\ \(x86\)/Intel\ RealSense\ SDK\ 2.0/include )
+target_include_directories( rs-colorize PRIVATE C:/Program\ Files\ \(x86\)/Intel\ RealSense\ SDK\ 2.0/include )
+target_link_libraries( rs-colorize C:/Program\ Files\ \(x86\)/Intel\ RealSense\ SDK\ 2.0/lib/x64/realsense2.lib )
 endif (WIN32)
 
 if (UNIX)

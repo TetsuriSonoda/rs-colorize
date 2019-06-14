@@ -11,7 +11,7 @@
 #include <librealsense2/rs.hpp> // Include RealSense Cross Platform API
 
 // Save as a pointcloud
-void SavePLY(std::string file_name, std::vector<float>& point_cloud)
+void SavePLY(std::string file_name, std::vector<float>& point_cloud, std::vector<unsigned char>& point_color)
 {
 	std::ofstream new_file;
 	new_file.open(file_name, std::ios::out);
@@ -23,12 +23,15 @@ void SavePLY(std::string file_name, std::vector<float>& point_cloud)
 	new_file << "property float x" << std::endl;
 	new_file << "property float y" << std::endl;
 	new_file << "property float z" << std::endl;
+	new_file << "property uchar red" << std::endl;
+	new_file << "property uchar green" << std::endl;
+	new_file << "property uchar blue" << std::endl;
 	new_file << "end_header" << std::endl;
 	new_file << std::endl;
 
 	for (int i = 0; i < point_cloud.size(); i += 3)
 	{
-		new_file << point_cloud[i] << " " << point_cloud[i + 1] << " " << point_cloud[i + 2] << std::endl;
+		new_file << point_cloud[i] << " " << point_cloud[i + 1] << " " << point_cloud[i + 2] << " " << (int)point_color[i + 2] << " " << (int)point_color[i + 1] << " " << (int)point_color[i + 0] << std::endl;
 	}
 }
 
@@ -169,21 +172,29 @@ void DisparityToDepth(rs2_intrinsics intrinsic, float stereo_baseline_meter, flo
 }
 
 // Compute point cloud: Output with right handed coordinate system as x: right y: down z: forward.
-void ComputePointCloud(rs2_intrinsics intrinsic, float depth_units, cv::Mat& depth_mat, std::vector<float>& point_cloud)
+void ComputePointCloud(rs2_intrinsics intrinsic, float depth_units, cv::Mat& depth_mat, cv::Mat& color_mat, std::vector<float>& point_cloud, std::vector<unsigned char>& point_color)
 {
 	point_cloud.clear();
+	point_color.clear();
 
 	for (int y = 0; y < intrinsic.height; y++)
 	{
 		for (int x = 0; x < intrinsic.width; x++)
 		{
 			auto depth_value = depth_mat.at<unsigned short>(y, x);
+			auto color_r = color_mat.at<cv::Vec3b>(y, x)[0];
+			auto color_g = color_mat.at<cv::Vec3b>(y, x)[1];
+			auto color_b = color_mat.at<cv::Vec3b>(y, x)[2];
 
 			if (depth_value > 0)
 			{
-				point_cloud.push_back(depth_value * (x - intrinsic.ppx) / intrinsic.fx * depth_units * 1000.0f);
-				point_cloud.push_back(depth_value * (y - intrinsic.ppy) / intrinsic.fy * depth_units * 1000.0f);
+				point_cloud.push_back(depth_value * (x - intrinsic.ppx) / intrinsic.fx * 3.5f * depth_units * 1000.0f);
+				point_cloud.push_back(depth_value * (y - intrinsic.ppy) / intrinsic.fy * 3.5f * depth_units * 1000.0f);
 				point_cloud.push_back((float)depth_value * depth_units * 1000.0f);
+
+				point_color.push_back(color_r);
+				point_color.push_back(color_g);
+				point_color.push_back(color_b);
 			}
 		}
 	}
@@ -194,14 +205,15 @@ int main(int argc, char * argv[]) try
 	auto image_width = 1280;
 	auto image_height = 720;
 
-	auto min_depth = 0.29f;
-	auto max_depth = 16.0f;
+	auto min_depth = 1.0f;
+	auto max_depth = 3.0f;
 
 	// Declare RealSense pipeline, encapsulating the actual device and sensors
 	rs2::pipeline pipe;
 	rs2::config cfg;
 	// Use a configuration object to request only depth from the pipeline
 	cfg.enable_stream(RS2_STREAM_DEPTH, image_width, image_height, RS2_FORMAT_Z16, 30);
+	cfg.enable_stream(RS2_STREAM_COLOR, image_width, image_height, RS2_FORMAT_BGR8, 30);
 	// Start streaming with the above configuration
 	pipe.start(cfg);
 
@@ -215,12 +227,13 @@ int main(int argc, char * argv[]) try
 	// stereo camera settings
 	ir_sensor.set_option(rs2_option::RS2_OPTION_DEPTH_UNITS, 0.001f);
 	ir_sensor.set_option(rs2_option::RS2_OPTION_LASER_POWER, 60);
-	ir_sensor.set_option(rs2_option::RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0);
-	ir_sensor.set_option(rs2_option::RS2_OPTION_EXPOSURE, 6000);
+	ir_sensor.set_option(rs2_option::RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1);
+//	ir_sensor.set_option(rs2_option::RS2_OPTION_EXPOSURE, 6000);
 
 	// Declare filters
 	rs2::decimation_filter dec_filter;  // Decimation - reduces depth frame density
 	rs2::threshold_filter thr_filter;   // Threshold  - removes values outside recommended range
+	rs2::align	aligned_to_color(RS2_STREAM_COLOR);
 	rs2::disparity_transform depth_to_disparity(true);	// Converting depth to disparity 
 	rs2::spatial_filter spat_filter;    // Spatial    - edge-preserving spatial smoothing
 	rs2::temporal_filter temp_filter;   // Temporal   - reduces temporal noise
@@ -260,14 +273,20 @@ int main(int argc, char * argv[]) try
 	rs2::frame colored_filtered;
 
 	// OpenCV matrices
+	// for color
+	auto rgb_color_mat = cv::Mat(cv::Size(image_width, image_height), CV_8UC3).setTo(0);
+
+	// for depth
 	auto depth_mat = cv::Mat(cv::Size(image_width, image_height), CV_16U).setTo(0);
 	auto disparity_mat = cv::Mat(cv::Size(image_width, image_height), CV_32F).setTo(0);
 	auto rgb_color_depth_mat = cv::Mat(cv::Size(image_width, image_height), CV_8UC3).setTo(0);
 	auto bgr_color_depth_mat = cv::Mat(cv::Size(image_width, image_height), CV_8UC3).setTo(0);
 
-	auto depth_intrinsics = pipe.get_active_profile().get_stream(rs2_stream::RS2_STREAM_DEPTH).as<rs2::video_stream_profile>().get_intrinsics();
+	// aligned to color intrinsics
+	auto depth_intrinsics = pipe.get_active_profile().get_stream(rs2_stream::RS2_STREAM_COLOR).as<rs2::video_stream_profile>().get_intrinsics();
 	auto depth_units = ir_sensor.get_option(rs2_option::RS2_OPTION_DEPTH_UNITS);
 	auto stereo_baseline = ir_sensor.get_option(rs2_option::RS2_OPTION_STEREO_BASELINE);
+	auto is_loaded = false;
 
 	cv::TickMeter tick_meter;
 
@@ -275,18 +294,20 @@ int main(int argc, char * argv[]) try
 
 	while (true)
 	{
-		rs2::frameset data = pipe.wait_for_frames(); // Wait for next set of frames from the camera
-		rs2::frame depth_frame = data.get_depth_frame(); //Take the depth frame from the frameset
-		if (!depth_frame) { break; } // Should not happen but if the pipeline is configured differently
+		rs2::frameset frames = pipe.wait_for_frames(); // Wait for next set of frames from the camera
+		if (!frames) { break; } // Should not happen but if the pipeline is configured differently
 									//  it might not provide depth and we don't want to crash
 
-		rs2::frame filtered = depth_frame; // Does not copy the frame, only adds a reference
+		rs2::frame filtered;// = frames.get_depth_frame(); //Take the depth frame from the frameset
 
 		// apply post processing filters
 		if (is_enabled)
 		{
 			//			filtered = dec_filter.process(filtered);	// not used
+			frames = aligned_to_color.process(frames);
+			filtered = frames.get_depth_frame();
 			filtered = thr_filter.process(filtered);
+
 			filtered = depth_to_disparity.process(filtered);
 			filtered = spat_filter.process(filtered);
 			filtered = temp_filter.process(filtered);
@@ -294,15 +315,25 @@ int main(int argc, char * argv[]) try
 			if (is_colorized) { filtered = color_filter.process(filtered); }
 			filtered = printer.process(filtered);
 		}
+		else
+		{
+			filtered = frames.get_depth_frame();
+		}
 
-		rs2::video_frame filtered_frame = filtered;
+
+		rs2::frame color_frame = frames.get_color_frame();
 
 		if (is_colorized)
 		{
-			// copy RGB frame to RGB mat
-			memcpy(rgb_color_depth_mat.data, filtered_frame.get_data(), sizeof(unsigned char) * rgb_color_depth_mat.size().width * rgb_color_depth_mat.size().height * 3);
-			// put depth conversion here
+			if (!is_loaded)
+			{
+				// copy colorized RGB frame to RGB mat
+				memcpy(rgb_color_depth_mat.data, filtered.get_data(), sizeof(unsigned char) * rgb_color_depth_mat.size().width * rgb_color_depth_mat.size().height * 3);
+				// copy RGB frame to RGB mat
+				memcpy(rgb_color_mat.data, color_frame.get_data(), sizeof(unsigned char) * rgb_color_mat.size().width * rgb_color_mat.size().height * 3);
+			}
 
+			// depth conversion here
 			if (is_disparity)
 			{
 				ColorizedDisparityToDepth(depth_intrinsics, stereo_baseline, min_depth, max_depth, depth_units, rgb_color_depth_mat, depth_mat);
@@ -322,16 +353,18 @@ int main(int argc, char * argv[]) try
 		{
 			if (is_disparity)
 			{
-				memcpy(disparity_mat.data, filtered_frame.get_data(), sizeof(float) * disparity_mat.size().width * disparity_mat.size().height);
+				memcpy(disparity_mat.data, filtered.get_data(), sizeof(float) * disparity_mat.size().width * disparity_mat.size().height);
 				DisparityToDepth(depth_intrinsics, stereo_baseline * 0.001f, depth_units, disparity_mat, depth_mat);
 				cv::imshow("Depth", depth_mat * 10);
 			}
 			else
 			{
-				memcpy(depth_mat.data, filtered_frame.get_data(), sizeof(unsigned short) * depth_mat.size().width * depth_mat.size().height);
+				memcpy(depth_mat.data, filtered.get_data(), sizeof(unsigned short) * depth_mat.size().width * depth_mat.size().height);
 				cv::imshow("Depth", depth_mat * 10);
 			}
 		}
+
+		cv::imshow("Color", rgb_color_mat);
 
 		auto in_key = cv::waitKey(1);
 
@@ -341,9 +374,33 @@ int main(int argc, char * argv[]) try
 		if (in_key == 's')	// save depth as point cloud and RGB image
 		{
 			std::vector<float> point_cloud;
-			ComputePointCloud(depth_intrinsics, depth_units, depth_mat, point_cloud);
-			SavePLY("pointcloud.ply", point_cloud);
+			std::vector<unsigned char> point_color;
+			ComputePointCloud(depth_intrinsics, depth_units, depth_mat, rgb_color_mat, point_cloud, point_color);
+			SavePLY("pointcloud.ply", point_cloud, point_color);
 		}
+		if (in_key == 'w' && is_colorized)	// save depth as image
+		{
+			std::vector<int> compression_params;
+			compression_params.push_back(cv::IMWRITE_JPEG_QUALITY);
+			compression_params.push_back(80);
+			cv::imwrite("Color.JPG", rgb_color_mat, compression_params);
+			cv::imwrite("Depth.JPG", rgb_color_depth_mat, compression_params);
+		}
+		if (in_key == 'l' && is_colorized)	// load depth as image
+		{
+			if (!is_loaded)
+			{
+				rgb_color_depth_mat = cv::imread("Depth.JPG");
+				rgb_color_mat = cv::imread("Color.JPG");
+				is_loaded = true;
+			}
+			else
+			{
+				is_loaded = false;
+			}
+
+		}
+
 	}
 
 	// Signal the processing thread to stop, and join

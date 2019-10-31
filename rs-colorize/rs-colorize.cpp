@@ -53,38 +53,32 @@ unsigned short RGBtoD(unsigned char r, unsigned char g, unsigned char b)
 			}
 			else
 			{
-				return (g - b) + 1535;
+				return (g - b) + 1529;
 			}
 		}
 		else if (g >= r && g >= b)
 		{
-			return b - r + 512;
+			return b - r + 510;
 		}
 		else if (b >= g && b >= r)
 		{
-			return r - g + 1024;
+			return r - g + 1020;
 		}
 	}
 
 	return 0;
 }
 
-void ColorizedDisparityToDepth(rs2_intrinsics intrinsic, float stereo_baseline_meter, float min_depth, float max_depth, float depth_units, cv::Mat& color_mat, cv::Mat& depth_mat)
+void ColorizedDisparityToDepth(float min_depth, float max_depth, float depth_units, cv::Mat& color_mat, cv::Mat& depth_mat)
 {
 	auto _width = color_mat.size().width;
 	auto _height = color_mat.size().height;
 
-	// same code to librealsense
-	auto _focal_lenght_mm = intrinsic.fx;
-	const uint8_t fractional_bits = 5;
-	const uint8_t fractions = 1 << fractional_bits;
-	auto _d2d_convert_factor = (stereo_baseline_meter * _focal_lenght_mm * fractions) / depth_units;
-
 	auto in = reinterpret_cast<const unsigned char*>(color_mat.data);
 	auto out = reinterpret_cast<unsigned short*>(depth_mat.data);
 
-	auto min_disparity = _d2d_convert_factor / max_depth;
-	auto max_disparity = _d2d_convert_factor / min_depth;
+	auto min_disparity = 1.0f / max_depth;
+	auto max_disparity = 1.0f / (min_depth + 0.1);
 
 	float input{};
 	//TODO SSE optimize
@@ -100,7 +94,7 @@ void ColorizedDisparityToDepth(rs2_intrinsics intrinsic, float stereo_baseline_m
 			if (out_value > 0)
 			{
 				input = min_disparity + (max_disparity - min_disparity) * out_value / 1535.0f;
-				*out++ = static_cast<unsigned short>((_d2d_convert_factor / input) / depth_units + 0.5f);
+				*out++ = static_cast<unsigned short>((1.0f / input) / depth_units + 0.5f);
 			}
 			else
 			{
@@ -143,16 +137,66 @@ void ColorizedDepthToDepth(float min_depth, float max_depth, float depth_units, 
 	}
 }
 
-void DisparityToDepth(rs2_intrinsics intrinsic, float stereo_baseline_meter, float depth_units, cv::Mat& disparity_mat, cv::Mat& depth_mat)
+unsigned short GetMedian(int diff_threshold, std::vector<unsigned short>& target_kernel)
+{
+	int num_array = target_kernel.size();
+	int counter = target_kernel.size();
+	int zero_counter = 0;
+	int i;
+	int v;
+
+	// bubble sort
+	for (i = 0; i < num_array; i++)
+	{
+		for (v = 0; v < num_array - 1; v++)
+		{
+			if (target_kernel[v] < target_kernel[v + 1])
+			{
+				if (target_kernel[v] == 0) { zero_counter++; }
+				// swap
+				int tmp = target_kernel[v + 1];
+				target_kernel[v + 1] = target_kernel[v];
+				target_kernel[v] = tmp;
+			}
+		}
+		counter = counter - 1;
+	}
+
+	if (target_kernel[num_array / 2 + 1] == 0) { return 0; }
+	else if (target_kernel[0] - target_kernel[num_array / 2 + 1] > diff_threshold * target_kernel[num_array / 2 + 1] / 1000 || zero_counter > 0) { return 0; }
+	else { return target_kernel[num_array / 2 + 1]; }
+}
+
+void PostProcessingMedianFilter(int kernel_size, int diff_threshold, cv::Mat& in_depth_mat, cv::Mat& out_depth_mat)
+{
+	std::vector<unsigned short> target_kernel;
+	target_kernel.resize(9);
+	out_depth_mat.setTo(0);
+
+	for (int y = kernel_size; y < in_depth_mat.size().height - kernel_size; y++)
+	{
+		for (int x = kernel_size; x < in_depth_mat.size().width - kernel_size; x++)
+		{
+			int counter = 0;
+			for (int yy = -kernel_size; yy < kernel_size + 1; yy += kernel_size)
+			{
+				for (int xx = -kernel_size; xx < kernel_size + 1; xx += kernel_size)
+				{
+					target_kernel[counter] = ((unsigned short*)in_depth_mat.data)[in_depth_mat.size().width * (y + yy) + (x + xx)];
+					counter++;
+				}
+			}
+
+			((unsigned short*)out_depth_mat.data)[in_depth_mat.size().width * y + x] = GetMedian(diff_threshold, target_kernel);
+		}
+	}
+}
+
+
+void DisparityToDepth(float depth_units, cv::Mat& disparity_mat, cv::Mat& depth_mat)
 {
 	auto _width = disparity_mat.size().width;
 	auto _height = disparity_mat.size().height;
-
-	// same code to librealsense
-	auto _focal_lenght_mm = intrinsic.fx;
-	const uint8_t fractional_bits = 5;
-	const uint8_t fractions = 1 << fractional_bits;
-	auto _d2d_convert_factor = (stereo_baseline_meter * _focal_lenght_mm * fractions) / depth_units;
 
 	auto in = reinterpret_cast<const float*>(disparity_mat.data);
 	auto out = reinterpret_cast<unsigned short*>(depth_mat.data);
@@ -164,7 +208,7 @@ void DisparityToDepth(rs2_intrinsics intrinsic, float stereo_baseline_meter, flo
 		{
 			input = *in;
 			if (std::isnormal(input))
-				*out++ = static_cast<unsigned short>((_d2d_convert_factor / input) + 0.5f);
+				*out++ = static_cast<unsigned short>((1.0f / input) / depth_units + 0.5f);
 			else
 				*out++ = 0;
 			in++;
@@ -188,8 +232,8 @@ void ComputePointCloud(rs2_intrinsics intrinsic, float depth_units, cv::Mat& dep
 
 			if (depth_value > 0)
 			{
-				point_cloud.push_back(depth_value * (x - intrinsic.ppx) / intrinsic.fx * 3.5f * depth_units * 1000.0f);
-				point_cloud.push_back(depth_value * (y - intrinsic.ppy) / intrinsic.fy * 3.5f * depth_units * 1000.0f);
+				point_cloud.push_back(depth_value * (x - intrinsic.ppx) / intrinsic.fx * depth_units * 1000.0f);
+				point_cloud.push_back(depth_value * (y - intrinsic.ppy) / intrinsic.fy * depth_units * 1000.0f);
 				point_cloud.push_back((float)depth_value * depth_units * 1000.0f);
 
 				point_color.push_back(color_r);
@@ -205,8 +249,8 @@ int main(int argc, char * argv[]) try
 	auto image_width = 1280;
 	auto image_height = 720;
 
-	auto min_depth = 1.0f;
-	auto max_depth = 3.0f;
+	auto min_depth = 0.29f;
+	auto max_depth = 10.0f;
 
 	// Declare RealSense pipeline, encapsulating the actual device and sensors
 	rs2::pipeline pipe;
@@ -260,12 +304,11 @@ int main(int argc, char * argv[]) try
 	rs2::frame_queue original_data;
 	rs2::frame_queue filtered_data;
 
-	// Atomic boolean to allow thread safe way to stop the thread
-	std::atomic<bool> stopped(false);
-	std::atomic<bool> is_enabled(true);
-
+	// flags 
+	bool is_enabled(true);
 	bool is_colorized(true);
 	bool is_disparity(true);
+	bool is_postprocess(false);
 
 	// Declare objects that will hold the calculated pointclouds and colored frames
 	// We save the last set of data to minimize flickering of the view
@@ -279,14 +322,21 @@ int main(int argc, char * argv[]) try
 	// for depth
 	auto depth_mat = cv::Mat(cv::Size(image_width, image_height), CV_16U).setTo(0);
 	auto disparity_mat = cv::Mat(cv::Size(image_width, image_height), CV_32F).setTo(0);
+	auto recovered_depth_mat = cv::Mat(cv::Size(image_width, image_height), CV_16U).setTo(0);
 	auto rgb_color_depth_mat = cv::Mat(cv::Size(image_width, image_height), CV_8UC3).setTo(0);
 	auto bgr_color_depth_mat = cv::Mat(cv::Size(image_width, image_height), CV_8UC3).setTo(0);
 
 	// aligned to color intrinsics
 	auto depth_intrinsics = pipe.get_active_profile().get_stream(rs2_stream::RS2_STREAM_COLOR).as<rs2::video_stream_profile>().get_intrinsics();
 	auto depth_units = ir_sensor.get_option(rs2_option::RS2_OPTION_DEPTH_UNITS);
-	auto stereo_baseline = ir_sensor.get_option(rs2_option::RS2_OPTION_STEREO_BASELINE);
 	auto is_loaded = false;
+
+	// for post processing
+	auto kernel_size = 3;
+	auto diff_threshold = 300;
+
+	// for JPG image
+	auto image_quality = 50;
 
 	cv::TickMeter tick_meter;
 
@@ -296,9 +346,9 @@ int main(int argc, char * argv[]) try
 	{
 		rs2::frameset frames = pipe.wait_for_frames(); // Wait for next set of frames from the camera
 		if (!frames) { break; } // Should not happen but if the pipeline is configured differently
-									//  it might not provide depth and we don't want to crash
+								//  it might not provide depth and we don't want to crash
 
-		rs2::frame filtered;// = frames.get_depth_frame(); //Take the depth frame from the frameset
+		rs2::frame filtered; //Take the depth frame from the frameset
 
 		// apply post processing filters
 		if (is_enabled)
@@ -336,12 +386,28 @@ int main(int argc, char * argv[]) try
 			// depth conversion here
 			if (is_disparity)
 			{
-				ColorizedDisparityToDepth(depth_intrinsics, stereo_baseline, min_depth, max_depth, depth_units, rgb_color_depth_mat, depth_mat);
+				ColorizedDisparityToDepth(min_depth, max_depth, depth_units, rgb_color_depth_mat, recovered_depth_mat);
+				if (is_postprocess)
+				{
+					PostProcessingMedianFilter(kernel_size, diff_threshold, recovered_depth_mat, depth_mat);
+				}
+				else
+				{
+					recovered_depth_mat.copyTo(depth_mat);
+				}
 				cv::imshow("Depth", depth_mat * 10);
 			}
 			else
 			{
-				ColorizedDepthToDepth(min_depth, max_depth, depth_units, rgb_color_depth_mat, depth_mat);
+				ColorizedDepthToDepth(min_depth, max_depth, depth_units, rgb_color_depth_mat, recovered_depth_mat);
+				if (is_postprocess)
+				{
+					PostProcessingMedianFilter(kernel_size, diff_threshold, recovered_depth_mat, depth_mat);
+				}
+				else
+				{
+					recovered_depth_mat.copyTo(depth_mat);
+				}
 				cv::imshow("Depth", depth_mat * 10);
 			}
 
@@ -354,7 +420,7 @@ int main(int argc, char * argv[]) try
 			if (is_disparity)
 			{
 				memcpy(disparity_mat.data, filtered.get_data(), sizeof(float) * disparity_mat.size().width * disparity_mat.size().height);
-				DisparityToDepth(depth_intrinsics, stereo_baseline * 0.001f, depth_units, disparity_mat, depth_mat);
+				DisparityToDepth(depth_units, disparity_mat, depth_mat);
 				cv::imshow("Depth", depth_mat * 10);
 			}
 			else
@@ -368,9 +434,11 @@ int main(int argc, char * argv[]) try
 
 		auto in_key = cv::waitKey(1);
 
+		// control by keyboard input
 		if (in_key == 'q' || in_key == 27) { break; }
 		if (in_key == 'c') { is_colorized = !is_colorized; }
 		if (in_key == 'd') { is_disparity = !is_disparity; }
+		if (in_key == 'p') { is_postprocess = !is_postprocess; }
 		if (in_key == 's')	// save depth as point cloud and RGB image
 		{
 			std::vector<float> point_cloud;
@@ -382,7 +450,7 @@ int main(int argc, char * argv[]) try
 		{
 			std::vector<int> compression_params;
 			compression_params.push_back(cv::IMWRITE_JPEG_QUALITY);
-			compression_params.push_back(80);
+			compression_params.push_back(image_quality);
 			cv::imwrite("Color.JPG", rgb_color_mat, compression_params);
 			cv::imwrite("Depth.JPG", rgb_color_depth_mat, compression_params);
 		}
@@ -402,10 +470,6 @@ int main(int argc, char * argv[]) try
 		}
 
 	}
-
-	// Signal the processing thread to stop, and join
-	// (Not the safest way to join a thread, please wrap your threads in some RAII manner)
-	stopped = true;
 
 	return EXIT_SUCCESS;
 }
